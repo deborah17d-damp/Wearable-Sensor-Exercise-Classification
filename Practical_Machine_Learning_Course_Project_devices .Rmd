@@ -1,0 +1,307 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "DEBORAH DAMPTEY"
+date: "2026-09-29"
+output:
+  html_document:
+    toc: true
+  pdf_document:
+    toc: true
+---
+
+# 1. Introduction
+
+Wearable activity-monitoring devices can collect large amounts of data describing human movement. Although these devices are commonly used to measure how much activity a person performs, they can also provide information about how an activity is performed.
+
+The objective of this project is to develop a machine learning model that predicts the manner in which participants performed a barbell lifting exercise. Accelerometer measurements were collected from sensors located on the belt, arm, dumbbell, and forearm of six participants. The response variable, `classe`, represents five different exercise performance categories labeled A through E.
+
+The goal of the analysis is to identify a predictive model that accurately classifies exercise performance, evaluate its expected out-of-sample performance using cross validation and a holdout sample, and use the selected model to predict the exercise classes of 20 observations in the provided testing dataset.
+
+```{r setup, include=FALSE}
+set.seed(12345)
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+library(caret)
+library(randomForest)
+```
+
+# 2. Data Loading and Initial Exploration
+
+The training and testing datasets were imported into R, with common representations of missing values treated consistently as missing observations. To keep the analysis reproducible, the two CSV files should be stored in the same directory as this R Markdown file.
+
+```{r load-data}
+training <- read.csv(
+  "pml-training.csv",
+  na.strings = c("", "NA", "#DIV/0!")
+)
+
+testing <- read.csv(
+  "pml-testing.csv",
+  na.strings = c("", "NA", "#DIV/0!")
+)
+```
+
+The training dataset contained `r format(nrow(training), big.mark=",")` observations and `r ncol(training)` variables, while the testing dataset contained `r nrow(testing)` observations and `r ncol(testing)` variables. The 20 observations in the testing dataset correspond to the cases for which final predictions are required.
+
+The response variable, `classe`, consisted of five categories representing the different manners in which the exercise was performed. All five classes were reasonably represented, with no extreme class imbalance.
+
+```{r initial-summary}
+class_counts <- data.frame(
+  Class = names(table(training$classe)),
+  Frequency = as.vector(table(training$classe)),
+  Proportion = round(as.vector(prop.table(table(training$classe))), 4)
+)
+
+knitr::kable(class_counts, caption = "Distribution of the response variable")
+```
+
+An initial examination showed that only `r sum(colSums(is.na(training)) == 0)` of the `r ncol(training)` variables contained complete observations. This indicated that missing data needed to be examined before selecting predictors for model development.
+
+# 3. Data Preparation and Cleaning
+
+The percentage of missing observations was calculated for each variable in the training dataset. A total of `r sum(missing_percent > 95)` variables contained more than 95% missing values. These variables mainly consisted of summary measures such as kurtosis, skewness, minimum, maximum, amplitude, variance, averages, and standard deviations. Because these variables contained very little observed information, they were excluded rather than relying on extensive imputation.
+
+```{r missingness-cleaning}
+missing_percent <- colMeans(is.na(training)) * 100
+keep_vars <- names(missing_percent[missing_percent <= 95])
+
+training_reduced <- training[, keep_vars]
+testing_keep_vars <- setdiff(keep_vars, "classe")
+testing_reduced <- testing[, testing_keep_vars]
+```
+
+Seven additional variables were excluded because they represented participant identification, observation order, timestamps, or data collection information rather than direct measurements of exercise movement: `X`, `user_name`, `raw_timestamp_part_1`, `raw_timestamp_part_2`, `cvtd_timestamp`, `new_window`, and `num_window`.
+
+```{r metadata-cleaning}
+remove_vars <- c(
+  "X",
+  "user_name",
+  "raw_timestamp_part_1",
+  "raw_timestamp_part_2",
+  "cvtd_timestamp",
+  "new_window",
+  "num_window"
+)
+
+training_clean <- training_reduced[
+  , !(names(training_reduced) %in% remove_vars)
+]
+
+testing_clean <- testing_reduced[
+  , !(names(testing_reduced) %in% remove_vars)
+]
+
+# Treat the response as a categorical outcome from this point forward.
+training_clean$classe <- factor(
+  training_clean$classe,
+  levels = c("A", "B", "C", "D", "E")
+)
+```
+
+The cleaned training dataset contained `r format(nrow(training_clean), big.mark=",")` observations and `r ncol(training_clean)` columns, consisting of `r ncol(training_clean) - 1` predictor variables and the response variable `classe`. The cleaned testing dataset contained the same `r ncol(testing_clean)` predictor variables for the 20 test observations.
+
+The predictor names were confirmed to match exactly between the training and testing datasets, and no missing values remained. The 52 predictors were also examined for near-zero variance. No predictors were identified as having near-zero variance, so all 52 sensor-based variables were retained as candidate predictors.
+
+```{r cleaning-checks}
+predictors_match <- all(
+  names(training_clean)[names(training_clean) != "classe"] ==
+    names(testing_clean)
+)
+
+nzv <- nearZeroVar(
+  training_clean[, names(training_clean) != "classe"],
+  saveMetrics = TRUE
+)
+
+cleaning_summary <- data.frame(
+  Check = c(
+    "Variables with more than 95% missing data removed",
+    "Final number of predictors",
+    "Missing values in cleaned training data",
+    "Missing values in cleaned testing data",
+    "Near-zero variance predictors",
+    "Training/testing predictor names match"
+  ),
+  Result = c(
+    sum(missing_percent > 95),
+    ncol(training_clean) - 1,
+    sum(is.na(training_clean)),
+    sum(is.na(testing_clean)),
+    sum(nzv$nzv),
+    predictors_match
+  )
+)
+
+knitr::kable(cleaning_summary, caption = "Data cleaning checks")
+```
+
+# 4. Training and Validation Strategy
+
+The cleaned training dataset was divided into two subsets using a stratified 70%/30% split. The larger subset was used for model development, while the remaining 30% was reserved as an independent validation set for evaluating final model performance.
+
+```{r data-split}
+set.seed(12345)
+
+train_index <- createDataPartition(
+  training_clean$classe,
+  p = 0.70,
+  list = FALSE
+)
+
+model_training <- training_clean[train_index, ]
+validation <- training_clean[-train_index, ]
+```
+
+The model training subset contained `r format(nrow(model_training), big.mark=",")` observations, while the validation subset contained `r format(nrow(validation), big.mark=",")` observations. Stratified sampling preserved nearly identical proportions of classes A through E in both subsets. The validation subset was not used during model development.
+
+```{r split-summary}
+split_summary <- data.frame(
+  Dataset = c("Model training", "Validation"),
+  Observations = c(nrow(model_training), nrow(validation))
+)
+
+knitr::kable(split_summary, caption = "Training and validation sample sizes")
+```
+
+Five fold cross validation was used within the model training subset for model tuning and comparison.
+
+```{r cross-validation-setup, echo=TRUE}
+set.seed(12345)
+
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = FALSE
+)
+```
+
+# 5. Model Development and Cross Validation
+
+Two classification approaches were evaluated: a Classification and Regression Tree (CART) and a Random Forest. CART was used as a simple baseline model. Random Forest was considered because it can capture nonlinear relationships and interactions among many sensor measurements while reducing the instability associated with a single decision tree.
+
+The CART model was tuned over values of the complexity parameter, `cp`, and the Random Forest was tuned over values of `mtry`, the number of predictors randomly considered at each split. Accuracy was used as the primary model-selection criterion.
+
+```{r fit-cart, echo=TRUE}
+set.seed(12345)
+
+tree_model <- train(
+  classe ~ .,
+  data = model_training,
+  method = "rpart",
+  trControl = cv_control,
+  tuneLength = 10
+)
+```
+
+```{r fit-random-forest, echo=TRUE}
+set.seed(12345)
+
+rf_model <- train(
+  classe ~ .,
+  data = model_training,
+  method = "rf",
+  trControl = cv_control,
+  tuneLength = 5,
+  importance = TRUE
+)
+```
+
+```{r model-comparison}
+tree_best_accuracy <- max(tree_model$results$Accuracy)
+rf_best_accuracy <- max(rf_model$results$Accuracy)
+
+tree_best_kappa <- tree_model$results$Kappa[
+  which.max(tree_model$results$Accuracy)
+]
+rf_best_kappa <- rf_model$results$Kappa[
+  which.max(rf_model$results$Accuracy)
+]
+
+model_comparison <- data.frame(
+  Model = c("CART", "Random Forest"),
+  Best_Tuning_Value = c(
+    paste0("cp = ", round(tree_model$bestTune$cp, 4)),
+    paste0("mtry = ", rf_model$bestTune$mtry)
+  ),
+  CV_Accuracy = sprintf("%.2f%%", 100 * c(tree_best_accuracy, rf_best_accuracy)),
+  Kappa = round(c(tree_best_kappa, rf_best_kappa), 3)
+)
+
+knitr::kable(model_comparison, caption = "Cross-validated model performance")
+```
+
+The classification tree achieved a maximum cross validated accuracy of approximately `r sprintf("%.2f%%", 100 * tree_best_accuracy)`, with a Kappa value of about `r sprintf("%.3f", tree_best_kappa)`. Random Forest produced substantially stronger performance, achieving approximately `r sprintf("%.2f%%", 100 * rf_best_accuracy)` cross validated accuracy and a Kappa value of about `r sprintf("%.3f", rf_best_kappa)`. Its optimal tuning value was **mtry = `r rf_model$bestTune$mtry`**. Based on this performance, Random Forest was selected for evaluation on the holdout validation dataset.
+
+# 6. Final Model Evaluation and Expected Out-of-Sample Error
+
+The selected Random Forest model was applied to the 30% holdout validation dataset, which had not been used during model training or cross validation.
+
+```{r validation-evaluation}
+rf_validation_pred <- predict(
+  rf_model,
+  newdata = validation
+)
+
+rf_confusion <- confusionMatrix(
+  rf_validation_pred,
+  validation$classe
+)
+
+validation_accuracy <- as.numeric(rf_confusion$overall["Accuracy"])
+validation_kappa <- as.numeric(rf_confusion$overall["Kappa"])
+out_of_sample_error <- 1 - validation_accuracy
+
+knitr::kable(
+  rf_confusion$table,
+  caption = "Random Forest confusion matrix on the holdout validation set"
+)
+```
+
+The Random Forest correctly classified `r sum(rf_validation_pred == validation$classe)` of the `r nrow(validation)` validation observations, resulting in an overall accuracy of approximately `r sprintf("%.2f%%", 100 * validation_accuracy)`. The Kappa statistic was `r sprintf("%.4f", validation_kappa)`, indicating very strong agreement between predicted and observed exercise classes. Only `r sum(rf_validation_pred != validation$classe)` observations were misclassified.
+
+The expected out-of-sample error was estimated as **1 − accuracy**, which was approximately **`r sprintf("%.2f%%", 100 * out_of_sample_error)`** for the holdout validation set. The strong holdout performance provides evidence that the selected model generalizes well to unseen observations from the same prediction setting.
+
+# 7. Final Model and Test Predictions
+
+After model selection and validation were completed, the Random Forest was refitted using the entire cleaned training dataset of `r format(nrow(training_clean), big.mark=",")` observations. All `r ncol(training_clean) - 1` retained sensor predictors were used, together with the tuning value selected during cross validation.
+
+```{r final-model}
+set.seed(12345)
+
+final_rf_model <- train(
+  classe ~ .,
+  data = training_clean,
+  method = "rf",
+  tuneGrid = data.frame(mtry = rf_model$bestTune$mtry),
+  trControl = trainControl(method = "none"),
+  importance = TRUE
+)
+```
+
+The final model was then used to predict the exercise performance class for the 20 observations in the provided testing dataset.
+
+```{r final-predictions}
+final_predictions <- predict(
+  final_rf_model,
+  newdata = testing_clean
+)
+
+prediction_results <- data.frame(
+  problem_id = 1:20,
+  predicted_classe = final_predictions
+)
+
+knitr::kable(prediction_results, caption = "Predicted classes for the 20 test cases")
+```
+
+The predicted classes, in order from test case 1 through test case 20, were **`r paste(final_predictions, collapse=", ")`**. The official test cases were used only after model development and validation had been completed.
+
+# 8. Conclusion
+
+This project developed a machine learning approach for predicting the manner in which participants performed a barbell lifting exercise using wearable sensor measurements. After removing variables with excessive missingness and non-sensor metadata, `r ncol(training_clean) - 1` predictors from the belt, arm, dumbbell, and forearm were retained for analysis.
+
+A classification tree and Random Forest were compared using five fold cross validation. The classification tree achieved a cross validated accuracy of approximately `r sprintf("%.2f%%", 100 * tree_best_accuracy)`, while the Random Forest achieved approximately `r sprintf("%.2f%%", 100 * rf_best_accuracy)`. The Random Forest was therefore selected as the final predictive model.
+
+When evaluated on the independent 30% holdout validation dataset, the Random Forest achieved an accuracy of approximately `r sprintf("%.2f%%", 100 * validation_accuracy)`, corresponding to an estimated out-of-sample error of approximately `r sprintf("%.2f%%", 100 * out_of_sample_error)`. The model was then refitted using the complete cleaned training dataset and used to generate predictions for the 20 provided test observations.
+
+Overall, the results indicate that the wearable sensor measurements provide strong predictive information for distinguishing among the five exercise performance classes.
